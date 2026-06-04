@@ -1,0 +1,22 @@
+# Scraping
+nodriver
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# Database (MongoDB Atlas async)
+motor==3.6.0
+pymongo==4.9.2
+
+# Validation / models
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# Telegram
+python-telegram-bot==21.7
+
+# Scheduler
+apscheduler==3.10.4
+
+# Utils
+python-dotenv==1.0.1
+tenacity==9.0.0
