@@ -6,7 +6,7 @@ Sahibinden'de ilan takibi yapan, fiyat düşüşlerini yakalayan ve Telegram'a b
 
 ## 🔍 Ne yapıyor?
 
-- Belirlediğin Sahibinden arama URL'sini her 30 dakikada bir tarar
+- Belirlediğin Sahibinden arama URL'sini manuel tetikleyerek tarar.
 - Tüm ilanları MongoDB'ye kaydeder, fiyat geçmişini tutar
 - İlk çalıştırmada sadece veri doldurur, bildirim atmaz
 - Sonraki taramalarda şunlar için Telegram mesajı atar:
