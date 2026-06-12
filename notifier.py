@@ -81,6 +81,18 @@ class TelegramNotifier:
 
         await self._send("\n".join(lines))
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def send_weekly_report(self, text: str, image_bytes: bytes) -> None:
+        await self._bot.send_message(
+            chat_id=self._chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        await asyncio.sleep(0.05)
+        await self._bot.send_photo(chat_id=self._chat_id, photo=image_bytes)
+        await asyncio.sleep(0.05)
+
     async def _send(self, text: str) -> None:
         await self._bot.send_message(
             chat_id=self._chat_id,

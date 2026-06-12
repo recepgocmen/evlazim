@@ -26,6 +26,9 @@ class Listing(BaseModel):
     price_history: list[PriceHistoryEntry] = []
     created_at: datetime
     updated_at: datetime
+    is_active: bool = True
+    removed_at: datetime | None = None
+    missed_scans: int = 0
 
 
 @dataclass
@@ -52,6 +55,9 @@ async def init_indexes() -> None:
     db = get_db()
     await db.listings.create_index("listing_id", unique=True)
     await db.listings.create_index([("location", 1), ("room_count", 1)])
+    await db.listings.create_index("is_active")
+    await db.listings.create_index("removed_at")
+    await db.weekly_metrics.create_index("recorded_at")
 
 
 async def upsert_listing(listing: Listing) -> UpsertResult:
@@ -61,10 +67,15 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
     existing = await db.listings.find_one({"listing_id": listing.listing_id})
 
     if existing is None:
-        doc = listing.model_dump(exclude={"created_at", "updated_at", "price_history"})
+        doc = listing.model_dump(
+            exclude={"created_at", "updated_at", "price_history", "removed_at", "missed_scans"}
+        )
         doc["price_history"] = []
         doc["created_at"] = now
         doc["updated_at"] = now
+        doc["is_active"] = True
+        doc["missed_scans"] = 0
+        doc["removed_at"] = None
         await db.listings.insert_one(doc)
         return UpsertResult(
             listing=listing,
@@ -84,6 +95,9 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
                     "price_value": listing.price_value,
                     "area_m2": listing.area_m2,
                     "updated_at": now,
+                    "is_active": True,
+                    "missed_scans": 0,
+                    "removed_at": None,
                 }
             },
         )
@@ -113,6 +127,9 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
                     "price_value": listing.price_value,
                     "area_m2": listing.area_m2,
                     "updated_at": now,
+                    "is_active": True,
+                    "missed_scans": 0,
+                    "removed_at": None,
                 },
                 "$push": {"price_history": history_entry},
             },
@@ -126,7 +143,7 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
             direction=direction,
         )
 
-    # fiyat aynı — updated_at + sayısal alanları backfill
+    # fiyat aynı — updated_at + sayısal alanları backfill; ilan görüldü, canlı işaretle
     await db.listings.update_one(
         {"listing_id": listing.listing_id},
         {
@@ -134,6 +151,9 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
                 "price_value": listing.price_value,
                 "area_m2": listing.area_m2,
                 "updated_at": now,
+                "is_active": True,
+                "missed_scans": 0,
+                "removed_at": None,
             }
         },
     )
@@ -144,6 +164,72 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
         old_price=None,
         old_price_value=None,
         direction=None,
+    )
+
+
+async def mark_missing_listings(seen_ids: set[str]) -> list[dict]:
+    """Taramada görülmeyen canlı ilanların missed_scans sayacını artırır;
+    eşiğe (>=2) ulaşanları is_active=False + removed_at ile işaretler.
+    Kaldırılan ilanların listesini döndürür."""
+    db = get_db()
+    now = datetime.now(tz=timezone.utc)
+    seen = list(seen_ids)
+
+    await db.listings.update_many(
+        {"is_active": {"$ne": False}, "listing_id": {"$nin": seen}},
+        {"$inc": {"missed_scans": 1}},
+    )
+
+    to_remove = await db.listings.find(
+        {
+            "is_active": {"$ne": False},
+            "missed_scans": {"$gte": 2},
+            "listing_id": {"$nin": seen},
+        },
+        {"listing_id": 1, "created_at": 1, "_id": 0},
+    ).to_list(length=None)
+
+    if to_remove:
+        await db.listings.update_many(
+            {"listing_id": {"$in": [d["listing_id"] for d in to_remove]}},
+            {"$set": {"is_active": False, "removed_at": now}},
+        )
+
+    return to_remove
+
+
+async def save_weekly_snapshot(avg_price_per_m2: float, sample_size: int) -> None:
+    """Bu haftanın ortalama m² fiyat özetini weekly_metrics koleksiyonuna yazar."""
+    db = get_db()
+    now = datetime.now(tz=timezone.utc)
+    await db.weekly_metrics.insert_one(
+        {
+            "recorded_at": now,
+            "avg_price_per_m2": avg_price_per_m2,
+            "sample_size": sample_size,
+        }
+    )
+
+
+async def get_weekly_snapshots(limit: int = 12) -> list[dict]:
+    """Grafik için son `limit` adet haftalık snapshot'ı artan sırada döndürür."""
+    db = get_db()
+    cursor = (
+        db.weekly_metrics.find({}, {"recorded_at": 1, "avg_price_per_m2": 1, "sample_size": 1, "_id": 0})
+        .sort("recorded_at", -1)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=None)
+    return list(reversed(docs))
+
+
+async def get_last_snapshot() -> dict | None:
+    """WoW hesabı için en son kaydedilmiş snapshot'ı döndürür."""
+    db = get_db()
+    return await db.weekly_metrics.find_one(
+        {},
+        {"avg_price_per_m2": 1, "sample_size": 1, "_id": 0},
+        sort=[("recorded_at", -1)],
     )
 
 

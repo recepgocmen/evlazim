@@ -20,3 +20,6 @@ apscheduler==3.10.4
 # Utils
 python-dotenv==1.0.1
 tenacity==9.0.0
+
+# Charting
+matplotlib==3.9.2

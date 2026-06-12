@@ -6,9 +6,9 @@ from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from analytics import compute_baseline, evaluate_opportunity
+from analytics import compute_baseline, evaluate_opportunity, generate_weekly_report
 from config import SCAN_INTERVAL_MIN, SEARCH_URL, settings
-from database import close as db_close, get_db, init_indexes, upsert_listing
+from database import close as db_close, get_db, init_indexes, mark_missing_listings, upsert_listing
 from notifier import TelegramNotifier
 from scraper import fetch_all_listings
 
@@ -75,10 +75,71 @@ async def scrape_job() -> None:
             except Exception as exc:
                 logger.error(f"failed to notify price change listing_id={listing.listing_id}: {exc}")
 
+    seen_ids = {l.listing_id for l in listings}
+    if not is_first_run:
+        removed = await mark_missing_listings(seen_ids)
+        if removed:
+            logger.info(f"marked {len(removed)} listings as removed/sold")
+
     logger.info(
         f"scrape done: total={len(listings)} new={new_count} "
         f"price_changed={changed_count} bootstrap={is_first_run}"
     )
+
+
+def _wow(x: float | None) -> str:
+    if x is None:
+        return "—"
+    arrow = "🔺" if x >= 0 else "📉"
+    sign = "+" if x >= 0 else ""
+    return f"{arrow} {sign}%{x:.1f}"
+
+
+def _format_weekly_report(report) -> str:
+    now_str = datetime.now().strftime("%d.%m.%Y")
+    days = f"{report.avg_days_on_market:.0f}" if report.avg_days_on_market is not None else "—"
+    discount = (
+        f"{report.avg_discount_amount:,.0f} TL"
+        if report.avg_discount_amount is not None
+        else "—"
+    )
+    return (
+        f"🏠 <b>EV LAZIM — HAFTALIK EMLAK PİYASASI ANALİZİ</b>\n"
+        f"📅 <i>Rapor Tarihi: {now_str}</i>\n"
+        f"📍 <i>Bölge: İstanbul / Maltepe &amp; İdealtepe</i>\n"
+        f"\n"
+        f"📈 <b>1. BÖLGESEL BİRİM FİYAT TRENDİ</b>\n"
+        f"• <b>Ortalama m² Fiyatı:</b> {report.avg_price_per_m2:,.0f} TL / m²\n"
+        f"• <b>Geçen Haftaya Göre Değişim:</b> {_wow(report.price_wow_pct)}\n"
+        f"💡 <i>Aktif ilanların ağırlıklı ortalama birim fiyatı.</i>\n"
+        f"\n"
+        f"⏱️ <b>2. PİYASA LİKİDİTESİ &amp; SATIŞ HIZI</b>\n"
+        f"• <b>Ortalama İlanda Kalma Süresi:</b> {days} Gün\n"
+        f"• <b>Bu Hafta İlandan Kalkan İlan Sayısı:</b> {report.removed_count} Adet\n"
+        f"💡 <i>30 günün altındaki süreler piyasanın canlı olduğunu gösterir.</i>\n"
+        f"\n"
+        f"📦 <b>3. ARZ &amp; STOK DURUMU</b>\n"
+        f"• <b>Aktif İlan Sayısı:</b> {report.sample_size} İlan\n"
+        f"• <b>Geçen Haftaya Göre Değişim:</b> {_wow(report.inventory_wow_pct)}\n"
+        f"💡 <i>Stok azalması talebin yüksek olduğunu gösterir.</i>\n"
+        f"\n"
+        f"🤝 <b>4. SATICI DAVRANIŞI &amp; PAZARLIK ESNEKLİĞİ</b>\n"
+        f"• <b>Fiyat Düşüren Satıcı Oranı:</b> %{report.drop_ratio * 100:.1f}\n"
+        f"• <b>Ortalama Yapılan İndirim Tutarı:</b> {discount}\n"
+        f"💡 <i>Bu oranın yükselmesi satıcıların pazarlığa daha açık olduğunu gösterir.</i>\n"
+        f"\n"
+        f"📊 <i>Haftalık TL/m² ve Stok değişim grafiği ektedir.</i>"
+    )
+
+
+async def weekly_report_job() -> None:
+    report = await generate_weekly_report()
+    text = _format_weekly_report(report)
+    try:
+        await notifier.send_weekly_report(text, report.chart_png)
+        logger.info("weekly report sent")
+    except Exception as exc:
+        logger.error(f"failed to send weekly report: {exc}")
 
 
 async def main(once: bool = False) -> None:
@@ -97,6 +158,7 @@ async def main(once: bool = False) -> None:
         minutes=SCAN_INTERVAL_MIN,
         next_run_time=datetime.now(),
     )
+    scheduler.add_job(weekly_report_job, "cron", day_of_week="mon", hour=9, minute=0)
     scheduler.start()
 
     stop_event = asyncio.Event()
@@ -115,6 +177,14 @@ async def main(once: bool = False) -> None:
     logger.info("shutdown complete")
 
 
+async def _run_weekly() -> None:
+    await init_indexes()
+    await weekly_report_job()
+    await db_close()
+
+
 if __name__ == "__main__":
-    once_mode = "--once" in sys.argv
-    asyncio.run(main(once=once_mode))
+    if "--weekly" in sys.argv:
+        asyncio.run(_run_weekly())
+    else:
+        asyncio.run(main(once="--once" in sys.argv))

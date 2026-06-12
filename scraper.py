@@ -54,15 +54,15 @@ async def fetch_all_listings(base_url: str) -> list[Listing]:
 
             await asyncio.sleep(random.uniform(2, 4))
             html = await tab.get_content()
-            page_listings = _parse_page(html)
+            page_listings, raw_row_count = _parse_page(html)
             all_listings.extend(page_listings)
 
             logger.info(
-                f"sayfa {page_num + 1}: {len(page_listings)} ilan, "
-                f"toplam={len(all_listings)}"
+                f"sayfa {page_num + 1}: {len(page_listings)} ilan "
+                f"({raw_row_count} ham satır), toplam={len(all_listings)}"
             )
 
-            if len(page_listings) < page_size:
+            if raw_row_count < page_size:
                 logger.info("son sayfa — tarama tamamlandı")
                 break
 
@@ -73,18 +73,18 @@ async def fetch_all_listings(base_url: str) -> list[Listing]:
     return all_listings
 
 
-def _parse_page(html: str) -> list[Listing]:
+def _parse_page(html: str) -> tuple[list[Listing], int]:
     soup = BeautifulSoup(html, "lxml")
-    # data-id attribute = gerçek ilan satırları; reklam/promo satırları atlanır
-    rows = [r for r in soup.select("tr.searchResultsItem") if r.get("data-id")]
-    logger.info(f"found {len(rows)} listing rows")
+    all_rows = soup.select("tr.searchResultsItem")
+    real_rows = [r for r in all_rows if r.get("data-id")]
+    logger.info(f"found {len(real_rows)} listing rows ({len(all_rows)} total incl. promos)")
 
     listings: list[Listing] = []
-    for row in rows:
+    for row in real_rows:
         listing = _parse_row(row)
         if listing:
             listings.append(listing)
-    return listings
+    return listings, len(all_rows)
 
 
 def _parse_price(text: str) -> int:
