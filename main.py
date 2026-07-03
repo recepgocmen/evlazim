@@ -8,9 +8,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from analytics import compute_baseline, evaluate_opportunity, generate_weekly_report
 from config import SCAN_INTERVAL_MIN, SEARCH_URL, settings
-from database import close as db_close, get_db, init_indexes, mark_missing_listings, upsert_listing
+from database import close as db_close, get_db, init_indexes, mark_missing_listings, mark_removed, upsert_listing
 from notifier import TelegramNotifier
-from scraper import fetch_all_listings
+from scraper import SessionExpiredError, fetch_all_listings, is_suspicious_title, verify_listings_live
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +25,18 @@ async def scrape_job() -> None:
     logger.info(f"scrape job starting — url={SEARCH_URL}")
     db = get_db()
 
-    listings = await fetch_all_listings(SEARCH_URL)
+    try:
+        listings = await fetch_all_listings(SEARCH_URL)
+    except SessionExpiredError as exc:
+        logger.error(f"oturum doldu: {exc}")
+        try:
+            await notifier.send_alert(
+                "Sahibinden oturumu doldu. python scraper.py --setup ile tekrar giris yap."
+            )
+        except Exception as notify_exc:
+            logger.error(f"alert gonderilemedi: {notify_exc}")
+        return
+
     if not listings:
         logger.warning("scrape returned 0 listings — skipping")
         return
@@ -36,6 +47,7 @@ async def scrape_job() -> None:
 
     new_count = 0
     changed_count = 0
+    candidates: list[tuple] = []  # (UpsertResult, Listing, opportunity | None)
 
     for listing in listings:
         result = await upsert_listing(listing)
@@ -50,11 +62,7 @@ async def scrape_job() -> None:
             )
             if baseline:
                 opportunity = evaluate_opportunity(listing, baseline)
-            try:
-                await notifier.send_new_listing(listing, opportunity)
-                new_count += 1
-            except Exception as exc:
-                logger.error(f"failed to notify new listing_id={listing.listing_id}: {exc}")
+            candidates.append((result, listing, opportunity))
 
         elif result.price_changed:
             opportunity = None
@@ -64,7 +72,25 @@ async def scrape_job() -> None:
                 )
                 if baseline:
                     opportunity = evaluate_opportunity(listing, baseline)
-            try:
+            candidates.append((result, listing, opportunity))
+
+    # Sadece supheligi tespit edilen ilanlarin detay sayfasini dogrula
+    suspicious_urls = [l.url for _, l, _ in candidates if is_suspicious_title(l.title)]
+    if suspicious_urls:
+        logger.info(f"{len(suspicious_urls)} supheligi tespit edilen ilan dogrulanacak")
+    live_map = await verify_listings_live(suspicious_urls) if suspicious_urls else {}
+
+    for result, listing, opportunity in candidates:
+        if is_suspicious_title(listing.title) and not live_map.get(listing.url, True):
+            logger.info(f"olu ilan atildi, DB'de kaldirildi: {listing.listing_id}")
+            await mark_removed(listing.listing_id)
+            continue
+
+        try:
+            if result.is_new:
+                await notifier.send_new_listing(listing, opportunity)
+                new_count += 1
+            elif result.price_changed:
                 await notifier.send_price_change(
                     listing,
                     old_price=result.old_price,
@@ -72,8 +98,8 @@ async def scrape_job() -> None:
                     opportunity=opportunity,
                 )
                 changed_count += 1
-            except Exception as exc:
-                logger.error(f"failed to notify price change listing_id={listing.listing_id}: {exc}")
+        except Exception as exc:
+            logger.error(f"failed to notify listing_id={listing.listing_id}: {exc}")
 
     seen_ids = {l.listing_id for l in listings}
     if not is_first_run:

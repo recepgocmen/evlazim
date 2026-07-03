@@ -93,6 +93,9 @@ class TelegramNotifier:
         await self._bot.send_photo(chat_id=self._chat_id, photo=image_bytes)
         await asyncio.sleep(0.05)
 
+    async def send_alert(self, text: str) -> None:
+        await self._send(_escape(text))
+
     async def _send(self, text: str) -> None:
         await self._bot.send_message(
             chat_id=self._chat_id,

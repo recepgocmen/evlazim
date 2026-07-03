@@ -167,6 +167,15 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
     )
 
 
+async def mark_removed(listing_id: str) -> None:
+    db = get_db()
+    now = datetime.now(tz=timezone.utc)
+    await db.listings.update_one(
+        {"listing_id": listing_id},
+        {"$set": {"is_active": False, "removed_at": now}},
+    )
+
+
 async def mark_missing_listings(seen_ids: set[str]) -> list[dict]:
     """Taramada görülmeyen canlı ilanların missed_scans sayacını artırır;
     eşiğe (>=2) ulaşanları is_active=False + removed_at ile işaretler.
