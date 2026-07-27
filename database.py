@@ -39,6 +39,8 @@ class UpsertResult:
     old_price: str | None
     old_price_value: int | None
     direction: str | None  # "drop" | "rise" | None
+    price_drop_count: int = 0  # bu düşüş dahil toplam düşüş sayısı
+    price_chain: list[str] | None = None  # ilk fiyattan güncel fiyata tüm zincir
 
 
 _client: motor.motor_asyncio.AsyncIOMotorClient | None = None
@@ -119,6 +121,13 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
             "recorded_at": now,
         }
         direction = "drop" if listing.price_value < existing_value else "rise"
+        prior_history = existing.get("price_history") or []
+        prior_drops = sum(
+            1 for h in prior_history if h.get("price_value", 0) > listing.price_value
+            # ponytail: sayıyoruz "bu anki fiyattan pahalı olan geçmiş kayıtlar" = önceki düşüşler
+        )
+        drop_count = (prior_drops + 1) if direction == "drop" else 0
+        price_chain = [h["price"] for h in prior_history] + [existing["price"], listing.price]
         await db.listings.update_one(
             {"listing_id": listing.listing_id},
             {
@@ -141,6 +150,8 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
             old_price=existing["price"],
             old_price_value=existing_value,
             direction=direction,
+            price_drop_count=drop_count,
+            price_chain=price_chain,
         )
 
     # fiyat aynı — updated_at + sayısal alanları backfill; ilan görüldü, canlı işaretle

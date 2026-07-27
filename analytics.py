@@ -87,10 +87,17 @@ class WeeklyReport:
     drop_ratio: float                 # 0.0–1.0; fiyat düşüren aktif ilan oranı
     avg_discount_amount: float | None  # ortalama indirim tutarı (TL)
     chart_png: bytes
+    new_count: int                    # son 7 günde eklenen ilan sayısı
+    net_inventory_change: int         # new_count - removed_count
+    dropped_count: int                # son 7 günde fiyat düşüren ilan adedi
+    median_price_per_m2: float
+    min_price_per_m2: float
+    max_price_per_m2: float
 
 
-async def compute_weekly_metrics() -> tuple[float, int]:
-    """Aktif ilanlardan bölge genelinde ortalama m² fiyatını hesaplar."""
+async def compute_weekly_metrics() -> tuple[float, int, float, float, float]:
+    """Aktif ilanlardan bölge genelinde m² fiyat istatistiklerini hesaplar.
+    Döner: (ortalama, adet, medyan, min, max)."""
     db = get_db()
     cursor = db.listings.find(
         {"is_active": {"$ne": False}, "price_value": {"$gt": 0}, "area_m2": {"$gt": 0}},
@@ -98,9 +105,22 @@ async def compute_weekly_metrics() -> tuple[float, int]:
     )
     docs = await cursor.to_list(length=None)
     if not docs:
-        return 0.0, 0
+        return 0.0, 0, 0.0, 0.0, 0.0
     prices = [d["price_value"] / d["area_m2"] for d in docs]
-    return statistics.mean(prices), len(prices)
+    return (
+        statistics.mean(prices),
+        len(prices),
+        statistics.median(prices),
+        min(prices),
+        max(prices),
+    )
+
+
+async def compute_new_listings_count() -> int:
+    """Son 7 günde eklenen (created_at) ilan sayısını döndürür."""
+    db = get_db()
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=7)
+    return await db.listings.count_documents({"created_at": {"$gte": cutoff}})
 
 
 async def compute_days_on_market() -> tuple[int, float | None]:
@@ -118,15 +138,15 @@ async def compute_days_on_market() -> tuple[int, float | None]:
     return len(days_list), statistics.mean(days_list)
 
 
-async def compute_seller_behavior() -> tuple[float, float | None]:
-    """Son 7 günde fiyat düşüren aktif ilanların oranını ve ort. indirim tutarını hesaplar."""
+async def compute_seller_behavior() -> tuple[float, float | None, int]:
+    """Son 7 günde fiyat düşüren aktif ilanların oranını, ort. indirim tutarını ve adedini hesaplar."""
     db = get_db()
     now = datetime.now(tz=timezone.utc)
     cutoff = now - timedelta(days=7)
 
     active_total = await db.listings.count_documents({"is_active": {"$ne": False}})
     if not active_total:
-        return 0.0, None
+        return 0.0, None, 0
 
     cursor = db.listings.find(
         {"is_active": {"$ne": False}, "price_history.recorded_at": {"$gte": cutoff}},
@@ -155,7 +175,7 @@ async def compute_seller_behavior() -> tuple[float, float | None]:
 
     ratio = dropped_listings / active_total
     avg_discount = statistics.mean(discounts) if discounts else None
-    return ratio, avg_discount
+    return ratio, avg_discount, dropped_listings
 
 
 def _render_trend_chart(snapshots: list[dict]) -> bytes:
@@ -198,12 +218,13 @@ def _render_trend_chart(snapshots: list[dict]) -> bytes:
 
 async def generate_weekly_report() -> WeeklyReport:
     """Haftalık analitik verileri toplar, snapshot kaydeder ve rapor döndürür."""
-    avg_ppm2, sample = await compute_weekly_metrics()
+    avg_ppm2, sample, median_ppm2, min_ppm2, max_ppm2 = await compute_weekly_metrics()
     prev = await get_last_snapshot()           # insert'ten ÖNCE oku (WoW için)
     await save_weekly_snapshot(avg_ppm2, sample)
     snapshots = await get_weekly_snapshots()
     removed_count, avg_days = await compute_days_on_market()
-    drop_ratio, avg_discount = await compute_seller_behavior()
+    drop_ratio, avg_discount, dropped_count = await compute_seller_behavior()
+    new_count = await compute_new_listings_count()
 
     price_wow = (
         (avg_ppm2 - prev["avg_price_per_m2"]) / prev["avg_price_per_m2"] * 100
@@ -227,4 +248,10 @@ async def generate_weekly_report() -> WeeklyReport:
         drop_ratio=drop_ratio,
         avg_discount_amount=avg_discount,
         chart_png=chart,
+        new_count=new_count,
+        net_inventory_change=new_count - removed_count,
+        dropped_count=dropped_count,
+        median_price_per_m2=median_ppm2,
+        min_price_per_m2=min_ppm2,
+        max_price_per_m2=max_ppm2,
     )

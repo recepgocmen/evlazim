@@ -48,13 +48,15 @@ class TelegramNotifier:
         old_price: str,
         direction: str,
         opportunity=None,
+        price_drop_count: int = 1,
+        price_chain: list[str] | None = None,
     ) -> None:
         lines = []
         if direction == "drop":
-            lines.append(
-                f"📉 *Fiyat Düştü\\!* "
-                f"Eski: {_escape(old_price)} → Yeni: {_escape(listing.price)}"
-            )
+            repeat = f" \\(bu satıcının {price_drop_count}\\. indirimi\\)" if price_drop_count > 1 else ""
+            chain = price_chain or [old_price, listing.price]
+            chain_str = " → ".join(_escape(p) for p in chain)
+            lines.append(f"📉 *Fiyat Düştü\\!*{repeat} {chain_str}")
         else:
             lines.append(
                 f"📈 *Fiyat Arttı* "

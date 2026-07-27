@@ -96,6 +96,8 @@ async def scrape_job() -> None:
                     old_price=result.old_price,
                     direction=result.direction,
                     opportunity=opportunity,
+                    price_drop_count=result.price_drop_count,
+                    price_chain=result.price_chain,
                 )
                 changed_count += 1
         except Exception as exc:
@@ -136,6 +138,8 @@ def _format_weekly_report(report) -> str:
         f"\n"
         f"📈 <b>1. BÖLGESEL BİRİM FİYAT TRENDİ</b>\n"
         f"• <b>Ortalama m² Fiyatı:</b> {report.avg_price_per_m2:,.0f} TL / m²\n"
+        f"• <b>Medyan / Min–Max:</b> {report.median_price_per_m2:,.0f} TL / m² "
+        f"({report.min_price_per_m2:,.0f} – {report.max_price_per_m2:,.0f})\n"
         f"• <b>Geçen Haftaya Göre Değişim:</b> {_wow(report.price_wow_pct)}\n"
         f"💡 <i>Aktif ilanların ağırlıklı ortalama birim fiyatı.</i>\n"
         f"\n"
@@ -146,11 +150,14 @@ def _format_weekly_report(report) -> str:
         f"\n"
         f"📦 <b>3. ARZ &amp; STOK DURUMU</b>\n"
         f"• <b>Aktif İlan Sayısı:</b> {report.sample_size} İlan\n"
+        f"• <b>Bu Hafta Eklenen / Kalkan:</b> +{report.new_count} / -{report.removed_count} "
+        f"(Net: {report.net_inventory_change:+d})\n"
         f"• <b>Geçen Haftaya Göre Değişim:</b> {_wow(report.inventory_wow_pct)}\n"
         f"💡 <i>Stok azalması talebin yüksek olduğunu gösterir.</i>\n"
         f"\n"
         f"🤝 <b>4. SATICI DAVRANIŞI &amp; PAZARLIK ESNEKLİĞİ</b>\n"
-        f"• <b>Fiyat Düşüren Satıcı Oranı:</b> %{report.drop_ratio * 100:.1f}\n"
+        f"• <b>Fiyat Düşüren Satıcı Oranı:</b> %{report.drop_ratio * 100:.1f} "
+        f"({report.dropped_count} ilan)\n"
         f"• <b>Ortalama Yapılan İndirim Tutarı:</b> {discount}\n"
         f"💡 <i>Bu oranın yükselmesi satıcıların pazarlığa daha açık olduğunu gösterir.</i>\n"
         f"\n"
