@@ -1,15 +1,24 @@
+import asyncio
 import io
+import json
 import logging
 import statistics
+import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import MIN_COMPARABLE_LISTINGS, OPPORTUNITY_THRESHOLD
-from database import Listing, get_db, get_last_snapshot, get_weekly_snapshots, save_weekly_snapshot
+from database import (
+    Listing,
+    get_db,
+    get_snapshot_before,
+    get_snapshots,
+    save_metrics_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +102,8 @@ class WeeklyReport:
     median_price_per_m2: float
     min_price_per_m2: float
     max_price_per_m2: float
+    usd_try: float | None            # rapor anındaki USD/TRY kuru
+    age_buckets: dict[str, int]      # aktif ilanların yayında kalma süresi dağılımı
 
 
 async def compute_weekly_metrics() -> tuple[float, int, float, float, float]:
@@ -138,6 +149,129 @@ async def compute_days_on_market() -> tuple[int, float | None]:
     return len(days_list), statistics.mean(days_list)
 
 
+async def compute_days_on_market_series(days: int = 60) -> list[tuple[object, float]]:
+    """Tarihe göre ortalama ilanda kalma süresi: her gün için, o günle biten 7 günlük
+    pencerede siteden kalkan ilanların ortalaması. Haftalık pencere, günlük 1-2 kaldırmanın
+    yarattığı gürültüyü söndürür."""
+    db = get_db()
+    today = datetime.now(tz=timezone.utc).date()
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days + 7)
+    cursor = db.listings.find(
+        {"removed_at": {"$gte": cutoff}},
+        {"created_at": 1, "removed_at": 1, "_id": 0},
+    )
+    docs = await cursor.to_list(length=None)
+
+    by_day: dict[object, list[int]] = {}
+    for d in docs:
+        by_day.setdefault(d["removed_at"].date(), []).append(
+            (d["removed_at"] - d["created_at"]).days
+        )
+
+    series = []
+    for offset in range(days, -1, -1):
+        day = today - timedelta(days=offset)
+        window = [
+            v for back in range(7) for v in by_day.get(day - timedelta(days=back), [])
+        ]
+        if window:
+            series.append((day, statistics.mean(window)))
+    return series
+
+
+_USD_TRY_URL = "https://open.er-api.com/v6/latest/USD"  # anahtarsız, günlük güncellenen ücretsiz API
+_AGE_BUCKETS = ("0-7 gün", "8-30 gün", "31-60 gün", "61-90 gün", "90+ gün")
+
+
+_usd_cache: tuple[float, datetime] | None = None
+
+
+def _get_json(url: str) -> dict:
+    # varsayılan python-urllib UA'sı bazı kur API'lerinde 403 alıyor
+    req = urllib.request.Request(url, headers={"User-Agent": "evlazim/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.load(resp)
+
+
+async def fetch_usd_try() -> float | None:
+    """Güncel USD/TRY kurunu döndürür; API erişilemezse None.
+    Kaynak günde bir güncellendiği için 6 saat cache'lenir (her taramada çağrılıyor)."""
+    global _usd_cache
+    now = datetime.now(tz=timezone.utc)
+    if _usd_cache and now - _usd_cache[1] < timedelta(hours=6):
+        return _usd_cache[0]
+
+    try:
+        rate = float((await asyncio.to_thread(_get_json, _USD_TRY_URL))["rates"]["TRY"])
+    except Exception as exc:  # ağ/format hatası taramayı bloklamasın
+        logger.warning(f"USD/TRY kuru alinamadi: {exc}")
+        return None
+    _usd_cache = (rate, now)
+    logger.info(f"USD/TRY = {rate:.4f}")
+    return rate
+
+
+_USD_HISTORY_URL = "https://api.frankfurter.dev/v1/{start}..{end}?base=USD&symbols=TRY"
+
+
+async def fetch_usd_try_history(start: date, end: date) -> dict[date, float]:
+    """Geçmiş günlerin USD/TRY serisi (ECB, anahtarsız). Kur alanı olmayan eski
+    snapshot'ların USD karşılığını hesaplamak için. Hafta sonu/tatil boşlukları bir
+    önceki iş gününün kuruyla doldurulur."""
+    # start hafta sonuna denk gelirse ilk günler boş kalmasın diye 5 gün geriden iste
+    url = _USD_HISTORY_URL.format(start=start - timedelta(days=5), end=end)
+    try:
+        raw = (await asyncio.to_thread(_get_json, url))["rates"]
+    except Exception as exc:
+        logger.warning(f"USD/TRY gecmisi alinamadi: {exc}")
+        return {}
+
+    published = {date.fromisoformat(k): v["TRY"] for k, v in raw.items()}
+    filled: dict[date, float] = {}
+    rate = None
+    day = start - timedelta(days=5)
+    while day <= end:
+        rate = published.get(day, rate)
+        if rate and day >= start:
+            filled[day] = rate
+        day += timedelta(days=1)
+    return filled
+
+
+async def record_snapshot() -> None:
+    """Her taramanın sonunda anlık piyasa metriklerini + kuru snapshot'lar."""
+    avg_ppm2, sample, *_ = await compute_weekly_metrics()
+    if not sample:
+        return
+    await save_metrics_snapshot(avg_ppm2, sample, await fetch_usd_try())
+
+
+def _age_bucket(days: int) -> str:
+    if days <= 7:
+        return _AGE_BUCKETS[0]
+    if days <= 30:
+        return _AGE_BUCKETS[1]
+    if days <= 60:
+        return _AGE_BUCKETS[2]
+    if days <= 90:
+        return _AGE_BUCKETS[3]
+    return _AGE_BUCKETS[4]
+
+
+async def compute_age_distribution() -> dict[str, int]:
+    """Aktif ilanların kaç gündür yayında olduğunu kovalara böler."""
+    db = get_db()
+    now = datetime.now(tz=timezone.utc).replace(tzinfo=None)  # Mongo naive UTC döner
+    cursor = db.listings.find(
+        {"is_active": {"$ne": False}}, {"created_at": 1, "_id": 0}
+    )
+    docs = await cursor.to_list(length=None)
+    buckets = dict.fromkeys(_AGE_BUCKETS, 0)
+    for d in docs:
+        buckets[_age_bucket((now - d["created_at"]).days)] += 1
+    return buckets
+
+
 async def compute_seller_behavior() -> tuple[float, float | None, int]:
     """Son 7 günde fiyat düşüren aktif ilanların oranını, ort. indirim tutarını ve adedini hesaplar."""
     db = get_db()
@@ -178,35 +312,104 @@ async def compute_seller_behavior() -> tuple[float, float | None, int]:
     return ratio, avg_discount, dropped_listings
 
 
-def _render_trend_chart(snapshots: list[dict]) -> bytes:
-    """weekly_metrics snapshot listesinden çift eksenli trend grafiği üretir.
-    Sol eksen: TL/m² (mavi), sağ eksen: aktif ilan sayısı/stok (turuncu)."""
-    dates = [d["recorded_at"] for d in snapshots]
-    prices = [d["avg_price_per_m2"] for d in snapshots]
-    stocks = [d.get("sample_size", 0) for d in snapshots]
+def _daily_series(
+    snapshots: list[dict], usd_history: dict[date, float] | None = None
+) -> list[dict]:
+    """Her taramada yazılan snapshot'ları günlük ortalamaya indirger — ham hâli
+    (günde ~100 nokta) grafikte okunmuyor. Snapshot'ta kur yoksa (eski kayıtlar)
+    o günün tarihsel kuru kullanılır."""
+    usd_history = usd_history or {}
+    by_day: dict[date, list[dict]] = {}
+    for d in snapshots:
+        by_day.setdefault(d["recorded_at"].date(), []).append(d)
 
-    fig, ax1 = plt.subplots(figsize=(9, 4))
+    series = []
+    for day in sorted(by_day):
+        rows = by_day[day]
+        price = statistics.mean(r["avg_price_per_m2"] for r in rows)
+        rate = next(
+            (r["usd_try"] for r in rows if r.get("usd_try")), usd_history.get(day)
+        )
+        series.append(
+            {
+                "date": day,
+                "price": price,
+                "stock": statistics.mean(r.get("sample_size", 0) for r in rows),
+                "usd_price": price / rate if rate else float("nan"),
+            }
+        )
+    return series
+
+
+def _render_trend_chart(
+    snapshots: list[dict],
+    age_buckets: dict[str, int],
+    dom_series: list[tuple[object, float]],
+    usd_history: dict[date, float] | None = None,
+) -> bytes:
+    """1) TL/m² + USD/m², 2) stok + ort. ilanda kalma süresi, 3) süre dağılımı."""
+    series = _daily_series(snapshots, usd_history)
+    dates = [d["date"] for d in series]
+    prices = [d["price"] for d in series]
+    stocks = [d["stock"] for d in series]
+    usd_prices = [d["usd_price"] for d in series]
+    # marker hep açık: tek günlük/kesik seriler (örn. kuru yeni gelen USD) çizgiyle görünmüyor
+    marker_size = 4
+
+    fig, (ax1, ax_stock, ax_age) = plt.subplots(
+        3, 1, figsize=(9, 10), gridspec_kw={"height_ratios": [3, 2, 2]}
+    )
 
     color_price = "#2563eb"
-    ax1.plot(dates, prices, marker="o", linewidth=2, color=color_price, label="TL/m²")
+    ax1.plot(dates, prices, marker="o", markersize=marker_size, linewidth=2,
+             color=color_price, label="TL/m²")
     ax1.set_ylabel("TL / m²", color=color_price)
     ax1.tick_params(axis="y", labelcolor=color_price)
     ax1.grid(True, linestyle="--", alpha=0.4)
 
     ax2 = ax1.twinx()
-    color_stock = "#f97316"
-    ax2.plot(dates, stocks, marker="s", linewidth=2, linestyle="--",
-             color=color_stock, label="Aktif İlan")
-    ax2.set_ylabel("Aktif İlan Sayısı", color=color_stock)
-    ax2.tick_params(axis="y", labelcolor=color_stock)
+    color_usd = "#16a34a"
+    ax2.plot(dates, usd_prices, marker="^", markersize=marker_size, linewidth=2, linestyle="-.",
+             color=color_usd, label="USD/m²")
+    ax2.set_ylabel("USD / m²", color=color_usd)
+    ax2.tick_params(axis="y", labelcolor=color_usd)
 
-    ax1.set_title("Haftalık TL/m² ve Aktif İlan (Stok)", fontsize=13)
+    ax1.set_title("Birim Fiyat Trendi — TL ve Dolar Bazlı", fontsize=13)
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=9)
 
-    fig.autofmt_xdate()
+    ax_stock.plot(dates, stocks, marker="s", markersize=marker_size, linewidth=2, linestyle="--",
+                  color="#f97316", label="Aktif İlan")
+    ax_stock.set_ylabel("Aktif İlan Sayısı", color="#f97316")
+    ax_stock.tick_params(axis="y", labelcolor="#f97316")
+    ax_stock.set_title("Stok ve Ortalama İlanda Kalma Süresi", fontsize=12)
+    ax_stock.grid(True, linestyle="--", alpha=0.4)
+
+    color_dom = "#9333ea"
+    ax_dom = ax_stock.twinx()
+    ax_dom.plot(
+        [d for d, _ in dom_series], [v for _, v in dom_series],
+        marker="d", markersize=marker_size, linewidth=2, color=color_dom,
+        label="Ort. İlanda Kalma (7g)",
+    )
+    ax_dom.set_ylabel("Gün", color=color_dom)
+    ax_dom.tick_params(axis="y", labelcolor=color_dom)
+
+    lines3, labels3 = ax_stock.get_legend_handles_labels()
+    lines4, labels4 = ax_dom.get_legend_handles_labels()
+    ax_stock.legend(lines3 + lines4, labels3 + labels4, loc="upper left", fontsize=9)
+
+    bars = ax_age.bar(list(age_buckets), list(age_buckets.values()), color="#0f766e")
+    ax_age.bar_label(bars, fontsize=9)
+    ax_age.set_ylabel("İlan Sayısı")
+    ax_age.set_title("Aktif İlanların Yayında Kalma Süresi", fontsize=12)
+    ax_age.grid(True, axis="y", linestyle="--", alpha=0.4)
+
+    # autofmt_xdate çoklu panelde üst eksenlerin tarih etiketlerini gizliyor; elle döndür
+    for ax in (ax1, ax_stock):
+        ax.tick_params(axis="x", rotation=30, labelsize=8)
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -217,14 +420,24 @@ def _render_trend_chart(snapshots: list[dict]) -> bytes:
 
 
 async def generate_weekly_report() -> WeeklyReport:
-    """Haftalık analitik verileri toplar, snapshot kaydeder ve rapor döndürür."""
+    """Haftalık analitik verileri toplar ve raporu döndürür.
+    Snapshot'lar her taramada record_snapshot() ile yazılır."""
     avg_ppm2, sample, median_ppm2, min_ppm2, max_ppm2 = await compute_weekly_metrics()
-    prev = await get_last_snapshot()           # insert'ten ÖNCE oku (WoW için)
-    await save_weekly_snapshot(avg_ppm2, sample)
-    snapshots = await get_weekly_snapshots()
+    prev = await get_snapshot_before(days=7)
+    snapshots = await get_snapshots()
     removed_count, avg_days = await compute_days_on_market()
     drop_ratio, avg_discount, dropped_count = await compute_seller_behavior()
     new_count = await compute_new_listings_count()
+    age_buckets = await compute_age_distribution()
+    dom_series = await compute_days_on_market_series()
+    usd_try = await fetch_usd_try()
+    usd_history = (
+        await fetch_usd_try_history(
+            snapshots[0]["recorded_at"].date(), datetime.now(tz=timezone.utc).date()
+        )
+        if snapshots
+        else {}
+    )
 
     price_wow = (
         (avg_ppm2 - prev["avg_price_per_m2"]) / prev["avg_price_per_m2"] * 100
@@ -237,7 +450,7 @@ async def generate_weekly_report() -> WeeklyReport:
         else None
     )
 
-    chart = _render_trend_chart(snapshots)
+    chart = _render_trend_chart(snapshots, age_buckets, dom_series, usd_history)
     return WeeklyReport(
         avg_price_per_m2=avg_ppm2,
         sample_size=sample,
@@ -254,4 +467,34 @@ async def generate_weekly_report() -> WeeklyReport:
         median_price_per_m2=median_ppm2,
         min_price_per_m2=min_ppm2,
         max_price_per_m2=max_ppm2,
+        usd_try=usd_try,
+        age_buckets=age_buckets,
     )
+
+
+if __name__ == "__main__":
+    # Kur/grafik hattının çalıştığını doğrular: python analytics.py
+    logging.basicConfig(level=logging.INFO)
+
+    async def _check():
+        rate = await fetch_usd_try()
+        print(f"guncel USD/TRY: {rate}")
+
+        today = datetime.now(tz=timezone.utc).date()
+        hist = await fetch_usd_try_history(today - timedelta(days=14), today)
+        print(f"gecmis kur: {len(hist)} gun, ornek: {sorted(hist.items())[:3]}")
+        # hafta sonları ECB kur yayınlamaz; forward-fill her günü doldurmalı
+        assert len(hist) == 15, hist  # forward-fill her günü doldurmalı (hafta sonu dahil)
+
+        snaps = [
+            {"recorded_at": datetime(2026, 8, 1, 9), "avg_price_per_m2": 60000, "sample_size": 100},
+            {"recorded_at": datetime(2026, 8, 1, 15), "avg_price_per_m2": 62000, "sample_size": 102},
+            {"recorded_at": datetime(2026, 8, 2, 9), "avg_price_per_m2": 61000,
+             "sample_size": 101, "usd_try": 40.0},
+        ]
+        series = _daily_series(snaps, {date(2026, 8, 1): 50.0})
+        assert series[0]["usd_price"] == 61000 / 50.0, series[0]   # kur geçmişten
+        assert series[1]["usd_price"] == 61000 / 40.0, series[1]   # snapshot'ın kendi kuru
+        print("USD serisi OK:", [(s["date"], round(s["usd_price"])) for s in series])
+
+    asyncio.run(_check())

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import motor.motor_asyncio
 from pydantic import BaseModel
@@ -40,7 +40,8 @@ class UpsertResult:
     old_price_value: int | None
     direction: str | None  # "drop" | "rise" | None
     price_drop_count: int = 0  # bu düşüş dahil toplam düşüş sayısı
-    price_chain: list[str] | None = None  # ilk fiyattan güncel fiyata tüm zincir
+    # ilk fiyattan güncel fiyata tüm zincir: (fiyat, o fiyata geçilen tarih)
+    price_chain: list[tuple[str, datetime | None]] | None = None
 
 
 _client: motor.motor_asyncio.AsyncIOMotorClient | None = None
@@ -127,7 +128,15 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
             # ponytail: sayıyoruz "bu anki fiyattan pahalı olan geçmiş kayıtlar" = önceki düşüşler
         )
         drop_count = (prior_drops + 1) if direction == "drop" else 0
-        price_chain = [h["price"] for h in prior_history] + [existing["price"], listing.price]
+        price_chain = list(
+            zip(
+                [h["price"] for h in prior_history] + [existing["price"], listing.price],
+                # ilk fiyat ilanın açılışından, sonrakiler bir önceki kaydın değişim anından geçerli
+                [existing.get("created_at")]
+                + [h.get("recorded_at") for h in prior_history]
+                + [now],
+            )
+        )
         await db.listings.update_one(
             {"listing_id": listing.listing_id},
             {
@@ -218,37 +227,47 @@ async def mark_missing_listings(seen_ids: set[str]) -> list[dict]:
     return to_remove
 
 
-async def save_weekly_snapshot(avg_price_per_m2: float, sample_size: int) -> None:
-    """Bu haftanın ortalama m² fiyat özetini weekly_metrics koleksiyonuna yazar."""
+_SNAPSHOT_FIELDS = {
+    "recorded_at": 1,
+    "avg_price_per_m2": 1,
+    "sample_size": 1,
+    "usd_try": 1,
+    "_id": 0,
+}
+
+
+async def save_metrics_snapshot(
+    avg_price_per_m2: float, sample_size: int, usd_try: float | None
+) -> None:
+    """Her taramada anlık piyasa özetini weekly_metrics koleksiyonuna yazar."""
     db = get_db()
-    now = datetime.now(tz=timezone.utc)
     await db.weekly_metrics.insert_one(
         {
-            "recorded_at": now,
+            "recorded_at": datetime.now(tz=timezone.utc),
             "avg_price_per_m2": avg_price_per_m2,
             "sample_size": sample_size,
+            "usd_try": usd_try,
         }
     )
 
 
-async def get_weekly_snapshots(limit: int = 12) -> list[dict]:
-    """Grafik için son `limit` adet haftalık snapshot'ı artan sırada döndürür."""
+async def get_snapshots(days: int = 60) -> list[dict]:
+    """Grafik için son `days` günün snapshot'larını artan sırada döndürür."""
     db = get_db()
-    cursor = (
-        db.weekly_metrics.find({}, {"recorded_at": 1, "avg_price_per_m2": 1, "sample_size": 1, "_id": 0})
-        .sort("recorded_at", -1)
-        .limit(limit)
-    )
-    docs = await cursor.to_list(length=None)
-    return list(reversed(docs))
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+    cursor = db.weekly_metrics.find(
+        {"recorded_at": {"$gte": cutoff}}, _SNAPSHOT_FIELDS
+    ).sort("recorded_at", 1)
+    return await cursor.to_list(length=None)
 
 
-async def get_last_snapshot() -> dict | None:
-    """WoW hesabı için en son kaydedilmiş snapshot'ı döndürür."""
+async def get_snapshot_before(days: int = 7) -> dict | None:
+    """WoW hesabı için `days` gün öncesine ait en yakın snapshot'ı döndürür."""
     db = get_db()
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     return await db.weekly_metrics.find_one(
-        {},
-        {"avg_price_per_m2": 1, "sample_size": 1, "_id": 0},
+        {"recorded_at": {"$lte": cutoff}},
+        _SNAPSHOT_FIELDS,
         sort=[("recorded_at", -1)],
     )
 

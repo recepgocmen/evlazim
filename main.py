@@ -6,7 +6,7 @@ from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from analytics import compute_baseline, evaluate_opportunity, generate_weekly_report
+from analytics import compute_baseline, evaluate_opportunity, generate_weekly_report, record_snapshot
 from config import SCAN_INTERVAL_MIN, SEARCH_URL, settings
 from database import close as db_close, get_db, init_indexes, mark_missing_listings, mark_removed, upsert_listing
 from notifier import TelegramNotifier
@@ -109,6 +109,8 @@ async def scrape_job() -> None:
         if removed:
             logger.info(f"marked {len(removed)} listings as removed/sold")
 
+    await record_snapshot()  # her taramada trend grafiği için veri noktası
+
     logger.info(
         f"scrape done: total={len(listings)} new={new_count} "
         f"price_changed={changed_count} bootstrap={is_first_run}"
@@ -131,6 +133,13 @@ def _format_weekly_report(report) -> str:
         if report.avg_discount_amount is not None
         else "—"
     )
+    usd_line = (
+        f"• <b>Dolar Bazlı Medyan:</b> "
+        f"${report.median_price_per_m2 / report.usd_try:,.0f} / m² "
+        f"<i>(kur: {report.usd_try:.2f} TL)</i>\n"
+        if report.usd_try
+        else "• <b>Dolar Bazlı Medyan:</b> — <i>(kur alınamadı)</i>\n"
+    )
     return (
         f"🏠 <b>EV LAZIM — HAFTALIK EMLAK PİYASASI ANALİZİ</b>\n"
         f"📅 <i>Rapor Tarihi: {now_str}</i>\n"
@@ -140,6 +149,7 @@ def _format_weekly_report(report) -> str:
         f"• <b>Ortalama m² Fiyatı:</b> {report.avg_price_per_m2:,.0f} TL / m²\n"
         f"• <b>Medyan / Min–Max:</b> {report.median_price_per_m2:,.0f} TL / m² "
         f"({report.min_price_per_m2:,.0f} – {report.max_price_per_m2:,.0f})\n"
+        f"{usd_line}"
         f"• <b>Geçen Haftaya Göre Değişim:</b> {_wow(report.price_wow_pct)}\n"
         f"💡 <i>Aktif ilanların ağırlıklı ortalama birim fiyatı.</i>\n"
         f"\n"
@@ -161,7 +171,7 @@ def _format_weekly_report(report) -> str:
         f"• <b>Ortalama Yapılan İndirim Tutarı:</b> {discount}\n"
         f"💡 <i>Bu oranın yükselmesi satıcıların pazarlığa daha açık olduğunu gösterir.</i>\n"
         f"\n"
-        f"📊 <i>Haftalık TL/m² ve Stok değişim grafiği ektedir.</i>"
+        f"📊 <i>TL/m² – USD/m² trendi, stok ve ilanda kalma süresi grafikleri ektedir.</i>"
     )
 
 

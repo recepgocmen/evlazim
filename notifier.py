@@ -1,5 +1,7 @@
 import asyncio
 import logging
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -49,13 +51,13 @@ class TelegramNotifier:
         direction: str,
         opportunity=None,
         price_drop_count: int = 1,
-        price_chain: list[str] | None = None,
+        price_chain: list[tuple[str, datetime | None]] | None = None,
     ) -> None:
         lines = []
         if direction == "drop":
             repeat = f" \\(bu satıcının {price_drop_count}\\. indirimi\\)" if price_drop_count > 1 else ""
-            chain = price_chain or [old_price, listing.price]
-            chain_str = " → ".join(_escape(p) for p in chain)
+            chain = price_chain or [(old_price, None), (listing.price, None)]
+            chain_str = " → ".join(_format_step(price, at) for price, at in chain)
             lines.append(f"📉 *Fiyat Düştü\\!*{repeat} {chain_str}")
         else:
             lines.append(
@@ -108,6 +110,19 @@ class TelegramNotifier:
         await asyncio.sleep(0.05)  # Telegram rate-limit buffer
 
 
+_MONTHS_TR = "Oca Şub Mar Nis May Haz Tem Ağu Eyl Eki Kas Ara".split()
+_TR_TZ = ZoneInfo("Europe/Istanbul")
+
+
+def _format_step(price: str, at: datetime | None) -> str:
+    if at is None:
+        return _escape(price)
+    if at.tzinfo is None:  # Mongo naive UTC döner
+        at = at.replace(tzinfo=timezone.utc)
+    local = at.astimezone(_TR_TZ)
+    return f"{_escape(price)} _\\({local.day} {_MONTHS_TR[local.month - 1]}\\)_"
+
+
 def _escape(text: str) -> str:
     """Escape special chars for MarkdownV2."""
     special = r"\_*[]()~`>#+-=|{}.!"
@@ -115,9 +130,14 @@ def _escape(text: str) -> str:
 
 
 if __name__ == "__main__":
-    import sys
-    from datetime import datetime, timezone
+    from datetime import timedelta
     logging.basicConfig(level=logging.INFO)
+
+    now_utc = datetime.now(tz=timezone.utc)
+    assert _format_step("5.000.000 TL", None) == "5\\.000\\.000 TL"
+    assert _format_step("5.000.000 TL", datetime(2026, 8, 8, tzinfo=timezone.utc)).endswith(
+        "_\\(8 Ağu\\)_"
+    )
 
     async def _test():
         from analytics import Baseline, Opportunity
@@ -148,6 +168,13 @@ if __name__ == "__main__":
             old_price="5.000.000 TL",
             direction="drop",
             opportunity=opportunity,
+            price_drop_count=3,
+            price_chain=[
+                ("5.400.000 TL", now_utc - timedelta(days=40)),
+                ("5.200.000 TL", now_utc - timedelta(days=21)),
+                ("5.000.000 TL", now_utc - timedelta(days=6)),
+                ("4.600.000 TL", now_utc),
+            ],
         )
 
         print("→ send_price_change (artış, fırsat yok):")
