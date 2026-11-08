@@ -19,7 +19,7 @@ class TelegramNotifier:
         self._chat_id = settings.telegram_chat_id
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    async def send_new_listing(self, listing: Listing, opportunity=None) -> None:
+    async def send_new_listing(self, listing: Listing, opportunity=None, relist=None) -> None:
         lines = []
         if opportunity:
             pct = round(opportunity.discount_pct * 100)
@@ -28,6 +28,11 @@ class TelegramNotifier:
             )
         lines.append(f"🏠 *{_escape(listing.title)}*")
         lines.append(f"💰 {_escape(listing.price)}")
+        if relist:
+            lines.append(
+                f"♻️ Muhtemelen tekrar ilan — önceki: "
+                f"{_format_step(relist['price'], relist['removed_at'])} kalktı"
+            )
         lines.append(f"📍 {_escape(listing.location)}")
         room = listing.room_count or "?"
         area = f"{listing.area_m2} m²" if listing.area_m2 else "?"

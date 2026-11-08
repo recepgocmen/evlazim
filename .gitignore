@@ -11,3 +11,7 @@ venv/
 dist/
 build/
 .DS_Store
+
+# koşu logları
+logs/
+_to_delete/

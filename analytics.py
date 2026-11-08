@@ -11,7 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from config import MIN_COMPARABLE_LISTINGS, OPPORTUNITY_THRESHOLD
+from config import FILTER_CHANGED_ON, MIN_COMPARABLE_LISTINGS, OPPORTUNITY_THRESHOLD
 from database import (
     Listing,
     get_db,
@@ -104,6 +104,13 @@ class WeeklyReport:
     max_price_per_m2: float
     usd_try: float | None            # rapor anındaki USD/TRY kuru
     age_buckets: dict[str, int]      # aktif ilanların yayında kalma süresi dağılımı
+    median_days_to_first_cut: float | None
+    median_total_cut_pct: float | None
+    removed_with_cut_ratio: float | None  # son 30 günde kalkanlardan indirim yapmış oran
+    relist_count: int                # son 7 günde tekrar ilana çıkan
+    segments: list[tuple[str, int, float]]  # (oda, adet, medyan TL/m²)
+    negotiation_targets: list[dict]
+    scan_count: int                  # son 7 günde başarılı tarama
 
 
 async def compute_weekly_metrics() -> tuple[float, int, float, float, float]:
@@ -149,18 +156,20 @@ async def compute_days_on_market() -> tuple[int, float | None]:
     return len(days_list), statistics.mean(days_list)
 
 
-async def compute_days_on_market_series(days: int = 60) -> list[tuple[object, float]]:
+async def compute_days_on_market_series() -> list[tuple[object, float]]:
     """Tarihe göre ortalama ilanda kalma süresi: her gün için, o günle biten 7 günlük
     pencerede siteden kalkan ilanların ortalaması. Haftalık pencere, günlük 1-2 kaldırmanın
-    yarattığı gürültüyü söndürür."""
+    yarattığı gürültüyü söndürür. Seri, veri başlangıcından bugüne kadar uzanır."""
     db = get_db()
     today = datetime.now(tz=timezone.utc).date()
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days + 7)
     cursor = db.listings.find(
-        {"removed_at": {"$gte": cutoff}},
+        {"removed_at": {"$ne": None}},
         {"created_at": 1, "removed_at": 1, "_id": 0},
     )
     docs = await cursor.to_list(length=None)
+    if not docs:
+        return []
+    days = (today - min(d["removed_at"] for d in docs).date()).days
 
     by_day: dict[object, list[int]] = {}
     for d in docs:
@@ -312,6 +321,135 @@ async def compute_seller_behavior() -> tuple[float, float | None, int]:
     return ratio, avg_discount, dropped_listings
 
 
+def _drops(d: dict) -> list[datetime]:
+    """İlanın fiyat düşürdüğü anlar. entry = değişim anındaki ESKİ fiyat."""
+    hist = d.get("price_history") or []
+    out = []
+    for i, entry in enumerate(hist):
+        new_val = hist[i + 1]["price_value"] if i + 1 < len(hist) else d["price_value"]
+        if new_val < entry["price_value"]:
+            out.append(entry["recorded_at"])
+    return out
+
+
+def _total_cut_pct(d: dict) -> float:
+    """İlk fiyattan güncel fiyata toplam indirim yüzdesi."""
+    start = d["price_history"][0]["price_value"]
+    return (start - d["price_value"]) / start * 100 if start else 0.0
+
+
+async def compute_price_cut_stats() -> tuple[float | None, float | None, float | None]:
+    """Döner: (ilk indirime kadar medyan gün, indirim yapanlarda medyan toplam indirim %,
+    son 30 günde kalkan ilanlardan en az bir kez indirim yapmış olanların oranı).
+    Son oran satışa yakınlığın kaba göstergesi: indirim yapan satılıyor mu?"""
+    db = get_db()
+    docs = await db.listings.find(
+        {"price_history.0": {"$exists": True}},
+        {"created_at": 1, "price_value": 1, "price_history": 1, "_id": 0},
+    ).to_list(length=None)
+
+    first_cut_days, cut_pcts = [], []
+    for d in docs:
+        drops = _drops(d)
+        if drops:
+            first_cut_days.append((drops[0] - d["created_at"]).days)
+            cut_pcts.append(_total_cut_pct(d))
+
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=30)
+    removed = await db.listings.find(
+        {"removed_at": {"$gte": cutoff}}, {"price_value": 1, "price_history": 1, "_id": 0}
+    ).to_list(length=None)
+
+    return (
+        statistics.median(first_cut_days) if first_cut_days else None,
+        statistics.median(cut_pcts) if cut_pcts else None,
+        sum(bool(_drops(d)) for d in removed) / len(removed) if removed else None,
+    )
+
+
+async def compute_segments() -> list[tuple[str, int, float]]:
+    """Oda sayısına göre aktif ilan adedi ve medyan TL/m²; az örnekli segmentler atlanır."""
+    db = get_db()
+    docs = await db.listings.find(
+        {"is_active": {"$ne": False}, "price_value": {"$gt": 0}, "area_m2": {"$gt": 0}},
+        {"room_count": 1, "price_value": 1, "area_m2": 1, "_id": 0},
+    ).to_list(length=None)
+    by_room: dict[str, list[float]] = {}
+    for d in docs:
+        by_room.setdefault(d.get("room_count") or "?", []).append(d["price_value"] / d["area_m2"])
+    rows = [
+        (room, len(v), statistics.median(v))
+        for room, v in by_room.items()
+        if len(v) >= MIN_COMPARABLE_LISTINGS
+    ]
+    return sorted(rows, key=lambda r: -r[1])
+
+
+async def find_negotiation_targets(limit: int = 5) -> list[dict]:
+    """60+ gündür ilanda ve 2+ kez fiyat kırmış aktif ilanlar: satıcı yorulmuş, pazarlığa açık.
+    En çok indirim yapan önce."""
+    db = get_db()
+    now = datetime.now(tz=timezone.utc).replace(tzinfo=None)  # Mongo naive UTC döner
+    docs = await db.listings.find(
+        {
+            "is_active": {"$ne": False},
+            "created_at": {"$lte": now - timedelta(days=60)},
+            "price_history.1": {"$exists": True},
+        },
+        {"title": 1, "url": 1, "price": 1, "price_value": 1, "created_at": 1,
+         "price_history": 1, "_id": 0},
+    ).to_list(length=None)
+
+    targets = [
+        {
+            "title": d["title"],
+            "url": d["url"],
+            "price": d["price"],
+            "days": (now - d["created_at"]).days,
+            "drops": len(_drops(d)),
+            "cut_pct": _total_cut_pct(d),
+        }
+        for d in docs
+        if len(_drops(d)) >= 2
+    ]
+    return sorted(targets, key=lambda t: -t["cut_pct"])[:limit]
+
+
+async def find_relist(listing: Listing) -> dict | None:
+    """Aynı başlık/konum/oda/m² ile son 90 günde kalkmış ilan: muhtemelen aynı ev yeni ID ile
+    tekrar ilanda (fiyat geçmişini sıfırlamak için yapılan klasik hamle).
+    Başlıksız eşleşme (konum+oda+m²) aktif ilanların %80'ini yakalıyordu — mahalle düzeyinde
+    konum çok kaba. ponytail: başlığı değiştirip tekrar ilan vereni kaçırır."""
+    if not listing.area_m2:
+        return None
+    return await get_db().listings.find_one(
+        {
+            "listing_id": {"$ne": listing.listing_id},
+            "title": listing.title,
+            "location": listing.location,
+            "room_count": listing.room_count,
+            "area_m2": listing.area_m2,
+            "removed_at": {"$gte": datetime.now(tz=timezone.utc) - timedelta(days=90)},
+        },
+        {"listing_id": 1, "price": 1, "price_value": 1, "removed_at": 1, "_id": 0},
+        sort=[("removed_at", -1)],
+    )
+
+
+async def compute_relist_count() -> int:
+    """Son 7 günde eklenen ve tekrar ilan olarak işaretlenen ilan sayısı."""
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=7)
+    return await get_db().listings.count_documents(
+        {"created_at": {"$gte": cutoff}, "relist_of": {"$exists": True}}
+    )
+
+
+async def compute_scan_count() -> int:
+    """Son 7 günde başarılı tarama sayısı; her başarılı tarama bir snapshot yazar."""
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=7)
+    return await get_db().weekly_metrics.count_documents({"recorded_at": {"$gte": cutoff}})
+
+
 def _daily_series(
     snapshots: list[dict], usd_history: dict[date, float] | None = None
 ) -> list[dict]:
@@ -410,6 +548,13 @@ def _render_trend_chart(
     # autofmt_xdate çoklu panelde üst eksenlerin tarih etiketlerini gizliyor; elle döndür
     for ax in (ax1, ax_stock):
         ax.tick_params(axis="x", rotation=30, labelsize=8)
+        ax.axvline(FILTER_CHANGED_ON, color="#64748b", linestyle=":", linewidth=1.5)
+    ax1.annotate(
+        "filtre değişti",
+        xy=(FILTER_CHANGED_ON, 1), xycoords=("data", "axes fraction"),
+        xytext=(-4, -4), textcoords="offset points",
+        fontsize=8, color="#64748b", ha="right", va="top",
+    )
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -430,6 +575,7 @@ async def generate_weekly_report() -> WeeklyReport:
     new_count = await compute_new_listings_count()
     age_buckets = await compute_age_distribution()
     dom_series = await compute_days_on_market_series()
+    first_cut_days, total_cut_pct, removed_cut_ratio = await compute_price_cut_stats()
     usd_try = await fetch_usd_try()
     usd_history = (
         await fetch_usd_try_history(
@@ -469,12 +615,30 @@ async def generate_weekly_report() -> WeeklyReport:
         max_price_per_m2=max_ppm2,
         usd_try=usd_try,
         age_buckets=age_buckets,
+        median_days_to_first_cut=first_cut_days,
+        median_total_cut_pct=total_cut_pct,
+        removed_with_cut_ratio=removed_cut_ratio,
+        relist_count=await compute_relist_count(),
+        segments=await compute_segments(),
+        negotiation_targets=await find_negotiation_targets(),
+        scan_count=await compute_scan_count(),
     )
 
 
 if __name__ == "__main__":
     # Kur/grafik hattının çalıştığını doğrular: python analytics.py
     logging.basicConfig(level=logging.INFO)
+
+    # 10M → 9.5M (düşüş) → 9.8M (artış) → güncel 9M (düşüş): 2 düşüş, toplam %10
+    t1, t2, t3 = datetime(2026, 8, 1), datetime(2026, 8, 10), datetime(2026, 8, 20)
+    doc = {"price_value": 9_000_000, "price_history": [
+        {"price_value": 10_000_000, "recorded_at": t1},
+        {"price_value": 9_500_000, "recorded_at": t2},
+        {"price_value": 9_800_000, "recorded_at": t3},
+    ]}
+    assert _drops(doc) == [t1, t3], _drops(doc)
+    assert _total_cut_pct(doc) == 10.0
+    print("indirim hesabı OK")
 
     async def _check():
         rate = await fetch_usd_try()
