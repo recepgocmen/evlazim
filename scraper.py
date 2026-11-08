@@ -24,12 +24,12 @@ class SessionExpiredError(Exception):
 
 _MAX_PAGES = 20
 
-# Standalone "var" veya "son X gun" iceren basliklar suphelidir
-_SUSPICIOUS_RE = re.compile(r"\bvar\b|son \d+ g[uü]n", re.IGNORECASE)
 
-
-def is_suspicious_title(title: str) -> bool:
-    return bool(_SUSPICIOUS_RE.search(title))
+def _is_honeypot(listing_id: str, href: str) -> bool:
+    # Sahibinden bot tuzagi: kelime salatasi baslik, URL'de "sb2f", eski 9 haneli id
+    # (gercekler 10 hane). Detayini acmak "olagan-disi-kullanim" engelini tetikliyor
+    # ve sonraki kosu ilk sayfada bloklaniyordu (cuma hatalarinin sebebi).
+    return "sb2f" in href or len(listing_id) < 10
 
 
 def _build_page_url(base_url: str, offset: int) -> str:
@@ -158,6 +158,11 @@ async def fetch_all_listings(base_url: str) -> list[Listing]:
                         if raw_row_count == 0:
                             logger.warning("giris sonrasi hala 0 ilan -- duruyorum")
                             break
+                    elif "olagan-disi-kullanim" in tab.url:
+                        # Giris gerekmez; engel 1-2 gunde kendiliginden kalkiyor
+                        raise SessionExpiredError(
+                            "olagan disi kullanim engeli -- giris gerekmez, sonraki kosu bekle"
+                        )
                     else:
                         raise SessionExpiredError(
                             "oturum suresi doldu -- python scraper.py --setup ile giris yenile"
@@ -182,40 +187,6 @@ async def fetch_all_listings(base_url: str) -> list[Listing]:
         await asyncio.sleep(1)  # nodriver aclose() task'inin calismasi icin
 
     return all_listings
-
-
-async def verify_listings_live(urls: list[str]) -> dict[str, bool]:
-    """Supheligi tespit edilen ilanlarin detay sayfasini kontrol eder.
-    Erisim basarisiz olursa fail-open (True) doner."""
-    if not urls:
-        return {}
-
-    live: dict[str, bool] = {}
-    _kill_stale_chrome()
-    browser = await _start_browser()
-    try:
-        for url in urls:
-            try:
-                tab = await browser.get(url)
-                await asyncio.sleep(3)
-                html = (await tab.get_content()).lower()
-                dead = (
-                    "aradığınız sayfa bulunamıyor" in html
-                    or "aradiginiz sayfa bulunamiyor" in html
-                    or "yayindan kaldirildi" in html
-                    or "yayından kaldırıldı" in html
-                )
-                live[url] = not dead
-                logger.info(f"verify {'CANLI' if live[url] else 'OLU'}: {url}")
-            except Exception as exc:
-                logger.warning(f"verify hatasi, fail-open: {url} -- {exc}")
-                live[url] = True
-            await asyncio.sleep(random.uniform(2, 4))
-    finally:
-        browser.stop()
-        await asyncio.sleep(1)
-
-    return live
 
 
 def _parse_page(html: str) -> tuple[list[Listing], int]:
@@ -255,6 +226,9 @@ def _parse_row(row) -> Listing | None:
         title = title_el.get_text(strip=True)
         href = title_el.get("href", "")
         url = f"https://www.sahibinden.com{href}" if href.startswith("/") else href
+        if _is_honeypot(listing_id, href):
+            logger.info(f"bot tuzagi ilan atlandi: {listing_id}")
+            return None
 
         price_el = row.select_one("td.searchResultsPriceValue span")
         price = price_el.get_text(strip=True) if price_el else ""

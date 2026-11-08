@@ -187,15 +187,6 @@ async def upsert_listing(listing: Listing) -> UpsertResult:
     )
 
 
-async def mark_removed(listing_id: str) -> None:
-    db = get_db()
-    now = datetime.now(tz=timezone.utc)
-    await db.listings.update_one(
-        {"listing_id": listing_id},
-        {"$set": {"is_active": False, "removed_at": now}},
-    )
-
-
 async def mark_missing_listings(seen_ids: set[str]) -> list[dict]:
     """Taramada görülmeyen canlı ilanların missed_scans sayacını artırır;
     eşiğe (>=2) ulaşanları is_active=False + removed_at ile işaretler.
@@ -251,13 +242,10 @@ async def save_metrics_snapshot(
     )
 
 
-async def get_snapshots(days: int = 60) -> list[dict]:
-    """Grafik için son `days` günün snapshot'larını artan sırada döndürür."""
+async def get_snapshots() -> list[dict]:
+    """Grafik için tüm snapshot'ları artan sırada döndürür."""
     db = get_db()
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
-    cursor = db.weekly_metrics.find(
-        {"recorded_at": {"$gte": cutoff}}, _SNAPSHOT_FIELDS
-    ).sort("recorded_at", 1)
+    cursor = db.weekly_metrics.find({}, _SNAPSHOT_FIELDS).sort("recorded_at", 1)
     return await cursor.to_list(length=None)
 
 
